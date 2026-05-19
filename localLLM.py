@@ -3,13 +3,29 @@ localLLM.py — Local MLX inference server / CLI tool
 =====================================================
 Modes
   python localLLM.py            # CLI: reads input/*.json, writes output/*.md
-  python localLLM.py --serve    # HTTP: POST /prompt  GET /health
+  python localLLM.py --serve    # HTTP: POST /prompt  GET /health  GET /files/<name>
 
 Response format
-  The model is instructed to wrap its chain-of-thought inside <thinking> … </thinking>
-  and its final answer inside <response> … </response>.
-  Full raw output is stored in the log at DEBUG level.
-  Only the <response> block is returned to the caller / written to the markdown file.
+  The model is instructed to use three XML tag types:
+
+  <thinking> … </thinking>
+      Internal chain-of-thought.  Stored in the log (DEBUG) only — never
+      returned to the caller.
+
+  <response> … </response>
+      Final, polished answer.  Returned to the caller and written to
+      output/response_<timestamp>.md.
+
+  <file name="filename.ext"> … </file>   (zero or more)
+      Any file the model wants to create (source code, config, CSV, etc.).
+      Each one is saved to output/<filename> and its content is also
+      included in the JSON response under the "files" key.
+      In server mode the files can be downloaded individually via
+      GET /files/<filename>.
+
+Security
+  File names produced by the model are sanitised: only the basename is
+  kept and path-traversal characters are rejected before writing.
 """
 
 from __future__ import annotations
@@ -26,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 import mlx_lm
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 from flask import request as flask_request
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,7 +54,7 @@ INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
 SERVER_PORT   = 48084
-MAX_TOKENS    = 6144
+MAX_TOKENS    = 12000
 
 # Delimiters the model is instructed to use
 TAG_THINKING  = ("thinking", "<thinking>",  "</thinking>")
@@ -46,15 +62,22 @@ TAG_RESPONSE  = ("response", "<response>",  "</response>")
 
 # System instruction injected into every prompt so the model structures output
 SYSTEM_INSTRUCTION = (
-    "Always structure your reply as follows — use these tags exactly:\n\n"
+    "Always structure your reply using these XML tags — and only these tags:\n\n"
     "<thinking>\n"
     "Your internal chain-of-thought, reasoning, and working notes go here.\n"
+    "The user will never see this section.\n"
     "</thinking>\n\n"
     "<response>\n"
-    "Your final, polished answer to the user goes here. "
-    "This is the only part the user will read.\n"
+    "Your final, polished answer to the user goes here.\n"
+    "Refer to any files you created by name so the user knows what was produced.\n"
     "</response>\n\n"
-    "Do not include any text outside these two XML blocks."
+    "If the user asks you to create one or more files, also include a block like "
+    "this for EACH file — placed after </response>:\n\n"
+    '<file name="example.py">\n'
+    "example.py\n"
+    "</file>\n\n"
+    "If no file is needed, omit the <file> block entirely.\n\n"
+    "Do not include any text outside the XML blocks described above."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,12 +179,30 @@ def _extract_tag(raw: str, tag_name: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _extract_files(raw: str) -> list[dict]:
+    """
+    Finds every  <file name="…">…</file>  block in *raw* and returns a list
+    of {"name": <safe filename>, "content": <text>} dicts.
+
+    The filename is sanitised: only the basename is kept and any entry that
+    still contains path-separator characters is skipped with a warning.
+    """
+    pattern = r'<file\s+name="([^"]+)">(.*?)</file>'
+    results = []
+    for raw_name, content in re.findall(pattern, raw, re.DOTALL):
+        safe_name = Path(raw_name).name          # drop any directory prefix
+        if "/" in safe_name or "\\" in safe_name or safe_name.startswith("."):
+            continue                             # reject remaining traversal attempts
+        results.append({"name": safe_name, "content": content.strip()})
+    return results
+
+
 def query_model(
     prompt_text: str,
     model,
     tokenizer,
     logger: logging.Logger,
-) -> tuple[str, str | None]:
+) -> tuple[str, str, list[dict]]:
     """
     Runs one inference pass.
 
@@ -169,9 +210,11 @@ def query_model(
     -------
     raw_output : str
         The complete, unmodified model output (logged at DEBUG).
-    final_response : str | None
-        Text extracted from the <response> block, or None if the model did
-        not follow the structured format (caller should fall back to raw_output).
+    final_response : str
+        Text extracted from the <response> block, or the full raw output if
+        the model did not follow the structured format.
+    extracted_files : list[dict]
+        Zero or more {"name": str, "content": str} dicts from <file> blocks.
     """
     messages = _build_messages(prompt_text)
 
@@ -181,7 +224,6 @@ def query_model(
             messages, tokenize=False, add_generation_prompt=True
         )
     except Exception:
-        # Fall back: prepend system text to the user message
         combined = f"{SYSTEM_INSTRUCTION}\n\n{prompt_text}"
         full_prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": combined}],
@@ -210,7 +252,12 @@ def query_model(
         )
         final_response = raw_output
 
-    return raw_output, final_response
+    extracted_files = _extract_files(raw_output)
+    if extracted_files:
+        names = [f["name"] for f in extracted_files]
+        logger.info(f"Model produced {len(extracted_files)} file(s): {names}")
+
+    return raw_output, final_response, extracted_files
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,10 +268,10 @@ def save_markdown(prompt: str, response: str, timestamp: str, logger: logging.Lo
     """
     Writes a formatted markdown file to OUTPUT_FOLDER and returns its path.
 
-    File name pattern: output/response_<timestamp>.md
+    File name pattern: output/<timestamp>_response.md
     """
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    filename = Path(OUTPUT_FOLDER) / f"response_{timestamp}.md"
+    filename = Path(OUTPUT_FOLDER) / f"{timestamp}_response.md"
 
     human_ts = datetime.strptime(timestamp, "%Y%m%d_%H%M%S").strftime(
         "%Y-%m-%d %H:%M:%S"
@@ -244,6 +291,33 @@ def save_markdown(prompt: str, response: str, timestamp: str, logger: logging.Lo
     filename.write_text(content, encoding="utf-8")
     logger.info(f"Markdown → {filename}")
     return filename
+
+
+def save_generated_files(
+    files: list[dict], timestamp: str, logger: logging.Logger
+) -> list[dict]:
+    """
+    Writes each model-generated file to OUTPUT_FOLDER.
+
+    To avoid collisions when the same filename is requested multiple times,
+    the timestamp is prepended to each name:
+        hello.py  →  output/<timestamp>_hello.py
+
+    Returns a list of dicts enriched with the saved path:
+        [{"name": "hello.py", "content": "…", "path": "output/…_hello.py"}, …]
+    """
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    saved = []
+    for file_info in files:
+        dest = Path(OUTPUT_FOLDER) / f"{timestamp}_{file_info['name']}"
+        dest.write_text(file_info["content"], encoding="utf-8")
+        logger.info(f"File saved → {dest}")
+        saved.append({
+            "name":    file_info["name"],
+            "path":    str(dest),
+            "content": file_info["content"],
+        })
+    return saved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,7 +340,9 @@ def run_pipeline(
 
     Returns
     -------
-    dict with keys: status, timestamp, prompt, response, output_file
+    dict with keys:
+        status, timestamp, prompt, response, markdown_file,
+        files (list of {name, path, content})
     """
     prompt = input_data.get("prompt")
     if not prompt:
@@ -277,17 +353,22 @@ def run_pipeline(
     model, tokenizer = get_model(logger)
 
     with _model_lock:
-        raw_output, final_response = query_model(prompt, model, tokenizer, logger)
+        raw_output, final_response, extracted_files = query_model(
+            prompt, model, tokenizer, logger
+        )
 
-    output_path = save_markdown(prompt, final_response, timestamp, logger)
+    markdown_path = save_markdown(prompt, final_response, timestamp, logger)
+    saved_files   = save_generated_files(extracted_files, timestamp, logger)
+
     logger.info(f"=== Done at {datetime.now().strftime('%H:%M:%S')} ===")
 
     return {
-        "status":      "ok",
-        "timestamp":   timestamp,
-        "prompt":      prompt,
-        "response":    final_response,
-        "output_file": str(output_path),
+        "status":        "ok",
+        "timestamp":     timestamp,
+        "prompt":        prompt,
+        "response":      final_response,
+        "markdown_file": str(markdown_path),
+        "files":         saved_files,
     }
 
 
@@ -311,6 +392,24 @@ def run_server_mode() -> None:
             "model":      Path(MODEL_PATH).name,
             "max_tokens": MAX_TOKENS,
         }), 200
+
+    @app.route("/files/<path:filename>", methods=["GET"])
+    def download_file(filename: str) -> tuple:
+        """
+        Serves a previously generated file from OUTPUT_FOLDER.
+        Example: GET /files/20240101_120000_hello.py
+        Only the basename is used — directory traversal is rejected.
+        """
+        safe_name = Path(filename).name
+        output_dir = Path(OUTPUT_FOLDER).resolve()
+        target     = output_dir / safe_name
+
+        if not target.exists():
+            return jsonify({"status": "error", "message": "File not found"}), 404
+
+        return send_from_directory(
+            str(output_dir), safe_name, as_attachment=True
+        )
 
     @app.route("/prompt", methods=["POST"])
     def prompt() -> tuple:
