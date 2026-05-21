@@ -320,6 +320,43 @@ def save_generated_files(
     return saved
 
 
+# Telegram message length limits
+_TG_CAPTION_LIMIT = 1024   # max chars for a file caption
+_TG_MESSAGE_LIMIT = 4096   # max chars for a plain text message
+_TG_PREVIEW_LIMIT = 3800   # safe budget for readme inline preview
+
+
+def build_telegram_payload(prompt: str, timestamp: str, reply: str) -> dict:
+    """
+    Builds the 'telegram' block included in every /generate response.
+
+    The Telegram bot can use this directly without any post-processing:
+
+      any_file      →   send via bot.send_document(); use 'filename' and
+                        encode 'content' as bytes for the file buffer.
+
+      md_file       →   same, send as a second document attachment.
+
+    """
+    full_readme = f"# Prompt: {prompt}\n {reply}"
+
+    # Caption: concise, emoji-annotated, always within Telegram's limit
+    prompt_short = prompt if len(prompt) <= 200 else prompt[:197] + "…"
+    caption = (
+        f"✅ *Reply generated*\n"
+        f"📋 *Goal:* {prompt_short}\n"
+        f"🕐 `{timestamp}`"
+    )
+    if len(caption) > _TG_CAPTION_LIMIT:
+        caption = caption[:_TG_CAPTION_LIMIT - 1] + "…"
+
+    return {
+        "caption": caption,
+        "reply": reply,
+    }
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,7 +396,7 @@ def run_pipeline(
 
     markdown_path = save_markdown(prompt, final_response, timestamp, logger)
     saved_files   = save_generated_files(extracted_files, timestamp, logger)
-
+    telegram = build_telegram_payload(prompt, timestamp, final_response)
     logger.info(f"=== Done at {datetime.now().strftime('%H:%M:%S')} ===")
 
     return {
@@ -369,6 +406,7 @@ def run_pipeline(
         "response":      final_response,
         "markdown_file": str(markdown_path),
         "files":         saved_files,
+        "telegram": telegram,
     }
 
 
