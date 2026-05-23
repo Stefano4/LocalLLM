@@ -49,7 +49,7 @@ from flask import request as flask_request
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL_PATH    = "/Volumes/TOSHIBA_NEW/HomeServer/AI Models/models/mlx-community/gemma-4-e2b-it-4bit"
+MODEL_PATH    = "~/Work/Dev/AI_Models/mlx-community/gemma-4-e2b-it-4bit"
 INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
