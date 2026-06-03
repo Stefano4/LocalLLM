@@ -31,9 +31,11 @@ Security
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import json
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -70,14 +72,21 @@ SYSTEM_INSTRUCTION = (
     "<response>\n"
     "Your final, polished answer to the user goes here.\n"
     "Refer to any files you created by name so the user knows what was produced.\n"
+    "ALWAYS GENERATE A RESPONSE.\n"
     "</response>\n\n"
     "If the user asks you to create one or more files, also include a block like "
     "this for EACH file — placed after </response>:\n\n"
     '<file name="example.py">\n'
-    "example.py\n"
+    "# full file content goes here — not the filename\n"
+    'print("Hello, world!")\n'
     "</file>\n\n"
-    "If no file is needed, omit the <file> block entirely.\n\n"
-    "Do not include any text outside the XML blocks described above."
+    "Rules for <file> blocks:\n"
+    "  • The content between the tags must be the complete file body, never just the filename.\n"
+    "  • Use a descriptive name with the correct extension (.py, .csv, .json, .sh, .md, etc.).\n"
+    "  • Produce one <file> block per file; never nest them.\n"
+    "  • If no file is needed, omit the <file> block entirely.\n\n"
+    "Do not include any text outside the XML blocks described above.\n"
+    "ALWAYS GENERATE A RESPONSE TAG.\n"
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +270,36 @@ def query_model(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MIME helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Supplement Python's mimetypes DB with common text extensions that are
+# sometimes missing on minimal systems.
+_EXTRA_MIME: dict[str, str] = {
+    ".md":   "text/markdown",
+    ".py":   "text/x-python",
+    ".sh":   "text/x-shellscript",
+    ".toml": "text/x-toml",
+    ".yaml": "text/yaml",
+    ".yml":  "text/yaml",
+    ".env":  "text/plain",
+    ".log":  "text/plain",
+    ".ts":   "text/typescript",
+    ".tsx":  "text/typescript",
+    ".jsx":  "text/javascript",
+}
+
+
+def _mime_type(filename: str) -> str:
+    """Returns the MIME type for *filename* based on its extension."""
+    ext = Path(filename).suffix.lower()
+    if ext in _EXTRA_MIME:
+        return _EXTRA_MIME[ext]
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Markdown output
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -303,19 +342,25 @@ def save_generated_files(
     the timestamp is prepended to each name:
         hello.py  →  output/<timestamp>_hello.py
 
-    Returns a list of dicts enriched with the saved path:
-        [{"name": "hello.py", "content": "…", "path": "output/…_hello.py"}, …]
+    Returns a list of dicts enriched with the saved path, MIME type, and
+    the server download URL:
+        [{"name": "hello.py", "content": "…", "path": "output/…_hello.py",
+          "mime_type": "text/x-python", "download_url": "/files/…_hello.py"}, …]
     """
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     saved = []
     for file_info in files:
-        dest = Path(OUTPUT_FOLDER) / f"{timestamp}_{file_info['name']}"
+        stored_name = f"{timestamp}_{file_info['name']}"
+        dest = Path(OUTPUT_FOLDER) / stored_name
         dest.write_text(file_info["content"], encoding="utf-8")
         logger.info(f"File saved → {dest}")
         saved.append({
-            "name":    file_info["name"],
-            "path":    str(dest),
-            "content": file_info["content"],
+            "name":         file_info["name"],
+            "stored_name":  stored_name,
+            "path":         str(dest),
+            "content":      file_info["content"],
+            "mime_type":    _mime_type(file_info["name"]),
+            "download_url": f"/files/{stored_name}",
         })
     return saved
 
@@ -325,34 +370,151 @@ _TG_CAPTION_LIMIT = 1024   # max chars for a file caption
 _TG_MESSAGE_LIMIT = 4096   # max chars for a plain text message
 _TG_PREVIEW_LIMIT = 3800   # safe budget for readme inline preview
 
+# Emoji map for common MIME type families
+_MIME_EMOJI: list[tuple[str, str]] = [
+    ("text/x-python",     "🐍"),
+    ("text/javascript",   "📜"),
+    ("text/typescript",   "📜"),
+    ("text/x-shellscript","🖥️"),
+    ("text/markdown",     "📝"),
+    ("text/html",         "🌐"),
+    ("text/csv",          "📊"),
+    ("application/json",  "🗂️"),
+    ("application/xml",   "🗂️"),
+    ("text/yaml",         "🗂️"),
+    ("text/plain",        "📄"),
+]
 
-def build_telegram_payload(prompt: str, timestamp: str, reply: str) -> dict:
+
+def _doc_emoji(mime_type: str) -> str:
+    for prefix, emoji in _MIME_EMOJI:
+        if mime_type.startswith(prefix):
+            return emoji
+    return "📎"
+
+
+def _make_document_entry(
+    display_name: str,
+    stored_name: str,
+    content: str,
+    mime_type: str,
+    extra_caption: str = "",
+) -> dict:
     """
-    Builds the 'telegram' block included in every /generate response.
+    Returns a single 'document' dict ready for a Telegram bot to call
+    ``bot.send_document()``.
+
+    Fields
+    ------
+    filename     : str   — original display name (e.g. "hello.py")
+    stored_name  : str   — timestamped name on disk (e.g. "20240101_…_hello.py")
+    mime_type    : str   — MIME type for the Telegram document object
+    content_b64  : str   — UTF-8 content base64-encoded; decode and wrap in
+                           io.BytesIO before passing to send_document()
+    download_url : str   — relative GET path; prepend the server base URL
+    caption      : str   — ready-to-send Markdown caption (≤ 1 024 chars)
+    """
+    caption = f"{_doc_emoji(mime_type)} `{display_name}`"
+    if extra_caption:
+        caption += f"\n{extra_caption}"
+    if len(caption) > _TG_CAPTION_LIMIT:
+        caption = caption[: _TG_CAPTION_LIMIT - 1] + "…"
+
+    return {
+        "filename":     display_name,
+        "stored_name":  stored_name,
+        "mime_type":    mime_type,
+        "content_b64":  base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "download_url": f"/files/{stored_name}",
+        "caption":      caption,
+    }
+
+
+def build_telegram_payload(
+    prompt: str,
+    timestamp: str,
+    reply: str,
+    markdown_path: Path,
+    saved_files: list[dict],
+) -> dict:
+    """
+    Builds the 'telegram' block included in every /prompt response.
 
     The Telegram bot can use this directly without any post-processing:
 
-      any_file      →   send via bot.send_document(); use 'filename' and
-                        encode 'content' as bytes for the file buffer.
+      telegram["caption"]           →  send as the caption of the first document,
+                                       or as a standalone message if no docs.
 
-      md_file       →   same, send as a second document attachment.
+      telegram["reply"]             →  plain-text response (use for inline display
+                                       or as a message before sending documents).
 
+      telegram["documents"]         →  list of document dicts, one per generated
+                                       file plus the markdown summary.  For each:
+                                         content_b64  → base64-decode → BytesIO
+                                         filename     → InputFile name
+                                         mime_type    → passed to send_document
+                                         caption      → per-file caption string
+                                         download_url → GET /files/<stored_name>
+
+    Typical bot loop
+    ----------------
+        import io, base64
+        for doc in payload["telegram"]["documents"]:
+            buf = io.BytesIO(base64.b64decode(doc["content_b64"]))
+            buf.name = doc["filename"]
+            await bot.send_document(chat_id, buf, caption=doc["caption"],
+                                    parse_mode="Markdown")
     """
-    full_readme = f"# Prompt: {prompt}\n {reply}"
-
-    # Caption: concise, emoji-annotated, always within Telegram's limit
+    # ── Top-level caption (shown before any documents) ──────────────────────
     prompt_short = prompt if len(prompt) <= 200 else prompt[:197] + "…"
+    file_count   = len(saved_files)
+    files_note   = (
+        f"📦 *{file_count} file{'s' if file_count != 1 else ''} generated*\n"
+        if file_count else ""
+    )
     caption = (
         f"✅ *Reply generated*\n"
         f"📋 *Goal:* {prompt_short}\n"
+        f"{files_note}"
         f"🕐 `{timestamp}`"
     )
     if len(caption) > _TG_CAPTION_LIMIT:
-        caption = caption[:_TG_CAPTION_LIMIT - 1] + "…"
+        caption = caption[: _TG_CAPTION_LIMIT - 1] + "…"
+
+    if len(reply) > _TG_MESSAGE_LIMIT:
+        reply = reply[:_TG_MESSAGE_LIMIT - 10] + "…"
+
+    # ── Document list ────────────────────────────────────────────────────────
+    documents: list[dict] = []
+
+    # 1. Markdown summary (always present)
+    md_stored = markdown_path.name
+    md_content = markdown_path.read_text(encoding="utf-8")
+    documents.append(
+        _make_document_entry(
+            display_name="response.md",
+            stored_name=md_stored,
+            content=md_content,
+            mime_type="text/markdown",
+            extra_caption="Full response with prompt",
+        )
+    )
+
+    # 2. Each model-generated file
+    for f in saved_files:
+        documents.append(
+            _make_document_entry(
+                display_name=f["name"],
+                stored_name=f["stored_name"],
+                content=f["content"],
+                mime_type=f["mime_type"],
+            )
+        )
 
     return {
-        "caption": caption,
-        "reply": reply,
+        "caption":   caption,
+        "reply":     reply,
+        "documents": documents,
     }
 
 
@@ -396,7 +558,9 @@ def run_pipeline(
 
     markdown_path = save_markdown(prompt, final_response, timestamp, logger)
     saved_files   = save_generated_files(extracted_files, timestamp, logger)
-    telegram = build_telegram_payload(prompt, timestamp, final_response)
+    telegram = build_telegram_payload(
+        prompt, timestamp, final_response, markdown_path, saved_files
+    )
     logger.info(f"=== Done at {datetime.now().strftime('%H:%M:%S')} ===")
 
     return {
@@ -437,8 +601,9 @@ def run_server_mode() -> None:
         Serves a previously generated file from OUTPUT_FOLDER.
         Example: GET /files/20240101_120000_hello.py
         Only the basename is used — directory traversal is rejected.
+        Content-Type is inferred from the file extension.
         """
-        safe_name = Path(filename).name
+        safe_name  = Path(filename).name
         output_dir = Path(OUTPUT_FOLDER).resolve()
         target     = output_dir / safe_name
 
@@ -446,7 +611,10 @@ def run_server_mode() -> None:
             return jsonify({"status": "error", "message": "File not found"}), 404
 
         return send_from_directory(
-            str(output_dir), safe_name, as_attachment=True
+            str(output_dir),
+            safe_name,
+            as_attachment=True,
+            mimetype=_mime_type(safe_name),
         )
 
     @app.route("/prompt", methods=["POST"])
