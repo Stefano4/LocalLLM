@@ -64,16 +64,17 @@ TAG_RESPONSE  = ("response", "<response>",  "</response>")
 
 # System instruction injected into every prompt so the model structures output
 SYSTEM_INSTRUCTION = (
-    "Always structure your reply using these XML tags — and only these tags:\n\n"
-    "<thinking>\n"
-    "Your internal chain-of-thought, reasoning, and working notes go here.\n"
-    "The user will never see this section.\n"
-    "</thinking>\n\n"
+    "Always structure your reply using these XML tags and only these tags: <thinking>, <response> and "
+    '<file name="example.py"> . In details:\n\n'
     "<response>\n"
     "Your final, polished answer to the user goes here.\n"
     "Refer to any files you created by name so the user knows what was produced.\n"
     "ALWAYS GENERATE A RESPONSE.\n"
     "</response>\n\n"
+    "<thinking>\n"
+    "Your internal chain-of-thought, reasoning, and working notes go here.\n"
+    "The user will never see this section.\n"
+    "</thinking>\n\n"
     "If the user asks you to create one or more files, also include a block like "
     "this for EACH file — placed after </response>:\n\n"
     '<file name="example.py">\n'
@@ -160,9 +161,10 @@ def unload_model(logger: logging.Logger) -> None:
     Called after every HTTP request so 8 GB RAM is not held between calls.
     """
     global _model, _tokenizer
-    _model = _tokenizer = None
+    _model     = None
+    _tokenizer = None
     gc.collect()
-    logger.info("Model unloaded.")
+    logger.info("Model unloaded from memory.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +515,7 @@ def build_telegram_payload(
 
     return {
         "caption":   caption,
-        "reply":     reply,
+        "reply":     "*Reply generated*",
         "documents": documents,
     }
 
