@@ -6,18 +6,22 @@ Modes
   python localLLM.py --serve    # HTTP: POST /prompt  GET /health  GET /files/<name>
 
 Response format
-  The model is instructed to use three XML tag types:
+  Output is produced with grammar-constrained decoding (via the `outlines`
+  library), not by asking the model to follow XML tags and hoping it
+  complies. The model is mechanically restricted, token by token, to only
+  ever emit text matching the ModelOutput JSON schema below — so parsing
+  never fails the way ad-hoc tag-scraping could.
 
-  <thinking> … </thinking>
-      Internal chain-of-thought.  Stored in the log (DEBUG) only — never
+  thinking  (str)
+      Internal chain-of-thought. Stored in the log (DEBUG) only — never
       returned to the caller.
 
-  <response> … </response>
-      Final, polished answer.  Returned to the caller and written to
-      output/response_<timestamp>.md.
+  response  (str)
+      Final, polished answer. Returned to the caller and written to
+      output/<timestamp>_response.md.
 
-  <file name="filename.ext"> … </file>   (zero or more)
-      Any file the model wants to create (source code, config, CSV, etc.).
+  files     (list of {name, content})
+      Any files the model wants to create (source code, config, CSV, etc.).
       Each one is saved to output/<filename> and its content is also
       included in the JSON response under the "files" key.
       In server mode the files can be downloaded individually via
@@ -37,15 +41,17 @@ import json
 import logging
 import mimetypes
 import os
-import re
 import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-
+import mlx.core as mx
 import mlx_lm
+import outlines
 from flask import Flask, jsonify, send_from_directory
 from flask import request as flask_request
+from outlines.inputs import Chat
+from pydantic import BaseModel, Field
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -58,44 +64,50 @@ LOG_FOLDER    = "logs"
 SERVER_PORT   = 48084
 MAX_TOKENS    = 12000
 
-# Delimiters the model is instructed to use
-TAG_THINKING  = ("thinking", "<thinking>",  "</thinking>")
-TAG_RESPONSE  = ("response", "<response>",  "</response>")
-
-# System instruction injected into every prompt so the model structures output
+# System instruction injected into every prompt. Note there is no need to
+# describe a tag syntax here — the schema below is enforced mechanically by
+# outlines' grammar-constrained decoding, so the model literally cannot
+# emit a token that would produce invalid/incomplete structure.
 SYSTEM_INSTRUCTION = (
-    "Always structure your reply using these XML tags and only these tags: <thinking>, <response> and "
-    '<file name="example.py"> . In details:\n\n'
-    "<response>\n"
-    "Your final, polished answer to the user goes here.\n"
-    "Refer to any files you created by name so the user knows what was produced.\n"
-    "ALWAYS GENERATE A RESPONSE.\n"
-    "</response>\n\n"
-    "<thinking>\n"
-    "Your internal chain-of-thought, reasoning, and working notes go here.\n"
-    "The user will never see this section.\n"
-    "</thinking>\n\n"
-    "If the user asks you to create one or more files, also include a block like "
-    "this for EACH file — placed after </response>:\n\n"
-    '<file name="example.py">\n'
-    "# full file content goes here — not the filename\n"
-    'print("Hello, world!")\n'
-    "</file>\n\n"
-    "Rules for <file> blocks:\n"
-    "  • The content between the tags must be the complete file body, never just the filename.\n"
-    "  • Use a descriptive name with the correct extension (.py, .csv, .json, .sh, .md, etc.).\n"
-    "  • Produce one <file> block per file; never nest them.\n"
-    "  • If no file is needed, omit the <file> block entirely.\n\n"
-    "Do not include any text outside the XML blocks described above.\n"
-    "ALWAYS GENERATE A RESPONSE TAG.\n"
+    "You must respond with exactly three things: your internal reasoning, "
+    "your final answer, and any files you want to create.\n\n"
+    "- thinking: your internal chain-of-thought and working notes. "
+    "The user will never see this.\n"
+    "- response: your final, polished answer to the user. Refer to any "
+    "files you created by name so the user knows what was produced. "
+    "Always provide a response.\n"
+    "- files: a list of files to create, if any. Each entry needs a "
+    "descriptive 'name' with the correct extension (.py, .csv, .json, "
+    ".sh, .md, etc.) and the complete file 'content' — never just the "
+    "filename. Leave this list empty if no file is needed.\n"
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured output schema
+# ─────────────────────────────────────────────────────────────────────────────
+# This schema IS the contract. outlines compiles it into a grammar and masks
+# the model's logits at every generation step so only tokens that keep the
+# output a valid instance of ModelOutput are ever sampled — the JSON is
+# guaranteed well-formed and guaranteed to have exactly these fields. There
+# is no longer a "the model forgot to close a tag" or "the model put a stray
+# < character mid-file" failure mode.
+
+class GeneratedFile(BaseModel):
+    name: str
+    content: str
+
+
+class ModelOutput(BaseModel):
+    thinking: str
+    response: str
+    files: list[GeneratedFile] = Field(default_factory=list)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global model state  (lazy-loaded, one set shared across all requests)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _model: object | None      = None
-_tokenizer: object | None  = None
 _model_lock                = threading.Lock()   # serialises inference on 8 GB RAM
 
 
@@ -141,134 +153,141 @@ def setup_logger(timestamp: str, stem: str) -> logging.Logger:
 # Model lifecycle
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_model(logger: logging.Logger) -> tuple:
-    """Lazy-loads the model on first call; returns (model, tokenizer)."""
-    global _model, _tokenizer
+def _clear_mlx_cache() -> tuple[int, int]:
+    """
+    Releases MLX's internal Metal buffer cache.
+
+    Dropping the Python reference to the model (and gc.collect()) only frees
+    the *Python* object. The Metal buffers that held the actual weight
+    tensors are managed by MLX's own caching allocator and are kept around
+    for reuse until you explicitly clear them — this is the same class of
+    problem as torch.cuda.empty_cache() on CUDA/MPS.
+
+    The function name moved from `mx.metal.clear_cache()` to the top-level
+    `mx.clear_cache()` in newer mlx versions; this checks both locations so
+    it works regardless of which version is installed.
+
+    Returns (active_bytes, cache_bytes) *after* clearing, for logging.
+    """
+    clear_fn = getattr(mx, "clear_cache", None) or getattr(
+        getattr(mx, "metal", None), "clear_cache", None
+    )
+    if clear_fn:
+        clear_fn()
+
+    active_fn = getattr(mx, "get_active_memory", None) or getattr(
+        getattr(mx, "metal", None), "get_active_memory", None
+    )
+    cache_fn = getattr(mx, "get_cache_memory", None) or getattr(
+        getattr(mx, "metal", None), "get_cache_memory", None
+    )
+    active = active_fn() if active_fn else -1
+    cache  = cache_fn() if cache_fn else -1
+    return active, cache
+
+
+def get_model(logger: logging.Logger):
+    """Lazy-loads the model on first call; returns the outlines-wrapped MLX model."""
+    global _model
     if _model is None:
         logger.info(f"Loading model from {MODEL_PATH}  (max_tokens={MAX_TOKENS})")
         try:
-            _model, _tokenizer = mlx_lm.load(MODEL_PATH)
+            _model = outlines.from_mlxlm(*mlx_lm.load(MODEL_PATH))
             logger.info("Model ready.")
         except Exception as exc:
             logger.error(f"Failed to load model: {exc}")
             raise
-    return _model, _tokenizer
+    return _model
 
 
 def unload_model(logger: logging.Logger) -> None:
     """
-    Drops model + tokenizer references and runs GC.
-    Called after every HTTP request so 8 GB RAM is not held between calls.
+    Drops the model reference, runs GC, and releases MLX's Metal buffer
+    cache so freed weight memory is actually returned, not just kept around
+    by MLX for reuse. Called after every HTTP request so 8 GB RAM is not
+    held between calls.
     """
-    global _model, _tokenizer
-    _model     = None
-    _tokenizer = None
+    global _model
+    _model = None
     gc.collect()
-    logger.info("Model unloaded from memory.")
+    active, cache = _clear_mlx_cache()
+    if active >= 0:
+        logger.info(
+            f"Model unloaded — MLX active={active / 1024**3:.2f} GB, "
+            f"cache={cache / 1024**3:.2f} GB after clear."
+        )
+    else:
+        logger.info("Model unloaded from memory.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inference
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_messages(prompt_text: str) -> list[dict]:
-    """Wraps the user prompt with the system instruction."""
-    return [
-        {"role": "system", "content": SYSTEM_INSTRUCTION},
-        {"role": "user",   "content": prompt_text},
-    ]
-
-
-def _extract_tag(raw: str, tag_name: str) -> str | None:
-    """
-    Returns the content of the first <tag_name>…</tag_name> block found in
-    *raw*, or None if the tag is absent.  Whitespace around the content is
-    stripped.
-    """
-    pattern = rf"<{tag_name}>(.*?)</{tag_name}>"
-    match = re.search(pattern, raw, re.DOTALL)
-    return match.group(1).strip() if match else None
-
-
-def _extract_files(raw: str) -> list[dict]:
-    """
-    Finds every  <file name="…">…</file>  block in *raw* and returns a list
-    of {"name": <safe filename>, "content": <text>} dicts.
-
-    The filename is sanitised: only the basename is kept and any entry that
-    still contains path-separator characters is skipped with a warning.
-    """
-    pattern = r'<file\s+name="([^"]+)">(.*?)</file>'
-    results = []
-    for raw_name, content in re.findall(pattern, raw, re.DOTALL):
-        safe_name = Path(raw_name).name          # drop any directory prefix
-        if "/" in safe_name or "\\" in safe_name or safe_name.startswith("."):
-            continue                             # reject remaining traversal attempts
-        results.append({"name": safe_name, "content": content.strip()})
-    return results
-
-
 def query_model(
     prompt_text: str,
     model,
-    tokenizer,
     logger: logging.Logger,
 ) -> tuple[str, str, list[dict]]:
     """
-    Runs one inference pass.
+    Runs one inference pass using grammar-constrained decoding: outlines
+    compiles the ModelOutput schema into a token-level mask, so the model
+    is physically unable to emit a token that would break the JSON
+    structure. There is no tag-matching, no "did it close the tag", no
+    "what if file content contains a literal < character" — the output is
+    guaranteed to be valid JSON satisfying the schema, full stop.
 
     Returns
     -------
     raw_output : str
-        The complete, unmodified model output (logged at DEBUG).
+        The complete JSON string returned by the model (logged at DEBUG).
     final_response : str
-        Text extracted from the <response> block, or the full raw output if
-        the model did not follow the structured format.
+        The `response` field from the parsed output.
     extracted_files : list[dict]
-        Zero or more {"name": str, "content": str} dicts from <file> blocks.
+        Zero or more {"name": str, "content": str} dicts from the `files`
+        field. Names are sanitised the same way the old regex path did:
+        only the basename is kept and traversal attempts are rejected.
     """
-    messages = _build_messages(prompt_text)
-
-    # Some tokenizers do not accept a system role; gracefully degrade
-    try:
-        full_prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    except Exception:
-        combined = f"{SYSTEM_INSTRUCTION}\n\n{prompt_text}"
-        full_prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": combined}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    prompt = Chat([
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user",   "content": prompt_text},
+    ])
 
     sep = "─" * 72
-    logger.debug(f"\n{sep}\nPROMPT\n{sep}\n{full_prompt}\n{sep}")
+    logger.debug(f"\n{sep}\nPROMPT\n{sep}\n{prompt_text}\n{sep}")
 
-    raw_output = mlx_lm.generate(
-        model, tokenizer, prompt=full_prompt, max_tokens=MAX_TOKENS
-    )
+    raw_output = model(prompt, output_type=ModelOutput, max_tokens=MAX_TOKENS)
 
-    logger.debug(f"\n{sep}\nRAW MODEL OUTPUT\n{sep}\n{raw_output}\n{sep}")
+    logger.debug(f"\n{sep}\nRAW MODEL OUTPUT (JSON)\n{sep}\n{raw_output}\n{sep}")
 
-    thinking = _extract_tag(raw_output, TAG_THINKING[0])
-    if thinking:
-        logger.debug(f"\n{sep}\nTHINKING BLOCK\n{sep}\n{thinking}\n{sep}")
+    try:
+        parsed = ModelOutput.model_validate_json(raw_output)
+    except Exception as exc:
+        # Practically this only happens if generation was cut off by
+        # max_tokens before the JSON object closed (a length problem, not a
+        # format problem). Fall back to returning the raw text so nothing
+        # is silently lost, and log loudly so it's easy to spot.
+        logger.error(f"Failed to parse structured output (likely truncated — "
+                      f"consider raising MAX_TOKENS): {exc}")
+        return raw_output, raw_output, []
 
-    final_response = _extract_tag(raw_output, TAG_RESPONSE[0])
-    if final_response is None:
-        logger.warning(
-            "Model output did not contain a <response> block. "
-            "Returning full output as the response."
-        )
-        final_response = raw_output
+    if parsed.thinking:
+        logger.debug(f"\n{sep}\nTHINKING BLOCK\n{sep}\n{parsed.thinking}\n{sep}")
 
-    extracted_files = _extract_files(raw_output)
+    extracted_files: list[dict] = []
+    for f in parsed.files:
+        safe_name = Path(f.name).name             # drop any directory prefix
+        if not safe_name or safe_name.startswith(".") \
+                or "/" in safe_name or "\\" in safe_name:
+            logger.warning(f"Rejected unsafe file name from model: {f.name!r}")
+            continue
+        extracted_files.append({"name": safe_name, "content": f.content})
+
     if extracted_files:
         names = [f["name"] for f in extracted_files]
         logger.info(f"Model produced {len(extracted_files)} file(s): {names}")
 
-    return raw_output, final_response, extracted_files
+    return raw_output, parsed.response, extracted_files
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,11 +570,11 @@ def run_pipeline(
 
     logger.info(f"Prompt: {prompt}")
 
-    model, tokenizer = get_model(logger)
+    model = get_model(logger)
 
     with _model_lock:
         raw_output, final_response, extracted_files = query_model(
-            prompt, model, tokenizer, logger
+            prompt, model, logger
         )
 
     markdown_path = save_markdown(prompt, final_response, timestamp, logger)
