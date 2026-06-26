@@ -47,10 +47,8 @@ from datetime import datetime
 from pathlib import Path
 import mlx.core as mx
 import mlx_lm
-import outlines
 from flask import Flask, jsonify, send_from_directory
 from flask import request as flask_request
-from outlines.inputs import Chat
 from pydantic import BaseModel, Field
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,11 +56,14 @@ from pydantic import BaseModel, Field
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODEL_PATH    = os.path.expanduser("~/Work/Dev/AI_Models/mlx-community/gemma-4-e2b-it-4bit")
+#MODEL_PATH    = os.path.expanduser("~/Work/Dev/AI_Models/lmstudio-community/Qwen3.5-9B-MLX-8bit")
 INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
 SERVER_PORT   = 48084
 MAX_TOKENS    = 12000
+MAX_KV_SIZE = 16384
+MAX_MX_MEMORY_GB = 14
 
 # System instruction injected into every prompt. Note there is no need to
 # describe a tag syntax here — the schema below is enforced mechanically by
@@ -187,12 +188,20 @@ def _clear_mlx_cache() -> tuple[int, int]:
 
 
 def get_model(logger: logging.Logger):
-    """Lazy-loads the model on first call; returns the outlines-wrapped MLX model."""
     global _model
     if _model is None:
+        # Raise Metal memory ceiling so KV cache fits alongside the weights
+        try:
+            limit_gb = MAX_MX_MEMORY_GB  # adjust down to 13 if still OOM, up if you have 24+ GB
+            mx.set_memory_limit(limit_gb * 1024 ** 3)
+            logger.info(f"Metal memory limit set to {limit_gb} GB")
+        except AttributeError:
+            pass  # older mlx build, skip
+
         logger.info(f"Loading model from {MODEL_PATH}  (max_tokens={MAX_TOKENS})")
         try:
-            _model = outlines.from_mlxlm(*mlx_lm.load(MODEL_PATH))
+            model, tokenizer = mlx_lm.load(MODEL_PATH)
+            _model = (model, tokenizer)
             logger.info("Model ready.")
         except Exception as exc:
             logger.error(f"Failed to load model: {exc}")
@@ -226,49 +235,51 @@ def unload_model(logger: logging.Logger) -> None:
 
 def query_model(
     prompt_text: str,
-    model,
+    model_tuple,
     logger: logging.Logger,
 ) -> tuple[str, str, list[dict]]:
-    """
-    Runs one inference pass using grammar-constrained decoding: outlines
-    compiles the ModelOutput schema into a token-level mask, so the model
-    is physically unable to emit a token that would break the JSON
-    structure. There is no tag-matching, no "did it close the tag", no
-    "what if file content contains a literal < character" — the output is
-    guaranteed to be valid JSON satisfying the schema, full stop.
+    model, tokenizer = model_tuple
 
-    Returns
-    -------
-    raw_output : str
-        The complete JSON string returned by the model (logged at DEBUG).
-    final_response : str
-        The `response` field from the parsed output.
-    extracted_files : list[dict]
-        Zero or more {"name": str, "content": str} dicts from the `files`
-        field. Names are sanitised the same way the old regex path did:
-        only the basename is kept and traversal attempts are rejected.
-    """
-    prompt = Chat([
-        {"role": "system", "content": SYSTEM_INSTRUCTION},
+    schema_str = json.dumps(ModelOutput.model_json_schema(), indent=2)
+    system_with_schema = (
+        SYSTEM_INSTRUCTION
+        + f"\n\nYou MUST respond with a single valid JSON object matching "
+          f"this exact schema — output nothing else, no markdown fences:\n{schema_str}"
+    )
+
+    messages = [
+        {"role": "system", "content": system_with_schema},
         {"role": "user",   "content": prompt_text},
-    ])
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
     sep = "─" * 72
     logger.debug(f"\n{sep}\nPROMPT\n{sep}\n{prompt_text}\n{sep}")
 
-    raw_output = model(prompt, output_type=ModelOutput, max_tokens=MAX_TOKENS)
+    raw_output = mlx_lm.generate(
+        model, tokenizer,
+        prompt=prompt,
+        max_tokens=MAX_TOKENS,
+        max_kv_size=MAX_KV_SIZE,
+        verbose=False,
+    )
 
-    logger.debug(f"\n{sep}\nRAW MODEL OUTPUT (JSON)\n{sep}\n{raw_output}\n{sep}")
+    logger.debug(f"\n{sep}\nRAW MODEL OUTPUT\n{sep}\n{raw_output}\n{sep}")
+
+    # Strip optional markdown fences the model might add anyway
+    clean = raw_output.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[-1]           # drop ```json line
+        clean = clean.rsplit("```", 1)[0].strip()  # drop closing ```
 
     try:
-        parsed = ModelOutput.model_validate_json(raw_output)
+        parsed = ModelOutput.model_validate_json(clean)
     except Exception as exc:
-        # Practically this only happens if generation was cut off by
-        # max_tokens before the JSON object closed (a length problem, not a
-        # format problem). Fall back to returning the raw text so nothing
-        # is silently lost, and log loudly so it's easy to spot.
-        logger.error(f"Failed to parse structured output (likely truncated — "
-                      f"consider raising MAX_TOKENS): {exc}")
+        logger.error(
+            f"Failed to parse structured output (consider raising MAX_TOKENS): {exc}"
+        )
         return raw_output, raw_output, []
 
     if parsed.thinking:
@@ -276,7 +287,7 @@ def query_model(
 
     extracted_files: list[dict] = []
     for f in parsed.files:
-        safe_name = Path(f.name).name             # drop any directory prefix
+        safe_name = Path(f.name).name
         if not safe_name or safe_name.startswith(".") \
                 or "/" in safe_name or "\\" in safe_name:
             logger.warning(f"Rejected unsafe file name from model: {f.name!r}")
