@@ -9,36 +9,39 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+
 import ollama
-from flask import Flask, jsonify, send_from_directory
-from flask import request as flask_request
+from flask import Flask, jsonify, send_from_directory, request as flask_request
 from pydantic import BaseModel, Field
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Il nome assegnato durante il comando 'ollama create'
-MODEL_NAME    = "qwen3-5-9b-local"
-
+MODEL_NAME    = "qwen3-5-9b-local"        # Name assigned via 'ollama create'
+OLLAMA_HOST   = "http://localhost:48085"  # Ollama daemon — managed by ollama_manager.sh
+SERVER_PORT   = 48084                     # This Flask web server
 INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
-SERVER_PORT   = 48084
 MAX_TOKENS    = 12000
 
+# Single Ollama client instance, reused across all requests
+_ollama_client = ollama.Client(host=OLLAMA_HOST)
+
 SYSTEM_INSTRUCTION = (
-    "You must respond with exactly three things: your internal reasoning, "
-    "your final answer, and any files you want to create.\n\n"
-    "- thinking: your internal chain-of-thought and working notes. "
-    "The user will never see this.\n"
-    "- response: your final, polished answer to the user. Refer to any "
-    "files you created by name so the user knows what was produced. "
-    "Always provide a response.\n"
-    "- files: a list of files to create, if any. Each entry needs a "
-    "descriptive 'name' with the correct extension (.py, .csv, .json, "
-    ".sh, .md, etc.) and the complete file 'content' — never just the "
-    "filename. Leave this list empty if no file is needed.\n"
+    "Think through the problem carefully before answering.\n\n"
+    "thinking — reason step by step: analyse the request, consider edge cases, "
+    "plan your approach. Be thorough here.\n\n"
+    "response — your final answer to the user. If you created files, "
+    "mention each by name. Do NOT reproduce file content here.\n\n"
+    "files — if the task requires any file, its full content MUST go here, "
+    "not in 'response'. Rules:\n"
+    "  • Use a descriptive name with the correct extension "
+    "(.py, .sh, .md, .json, .csv, .html, etc.)\n"
+    "  • Always write the complete, working content — never a stub, "
+    "placeholder comment, or 'see above'.\n"
+    "  • Set to [] if no file is needed."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,7 +56,7 @@ class GeneratedFile(BaseModel):
 class ModelOutput(BaseModel):
     thinking: str
     response: str
-    files: list[GeneratedFile] = Field(default_factory=list)
+    files: list[GeneratedFile]   # no default → required in JSON schema → Ollama always emits it
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -71,28 +74,33 @@ def setup_logger(timestamp: str, stem: str) -> logging.Logger:
         "[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%H:%M:%S"
     )
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(fmt)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(fmt)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
     logger.info(f"Log → {log_path}")
     return logger
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inference Engine
+# Inference
 # ─────────────────────────────────────────────────────────────────────────────
 
 def query_model(
     prompt_text: str,
     logger: logging.Logger,
 ) -> tuple[str, str, list[dict]]:
+    """
+    Send prompt_text to Ollama and return (raw_output, final_response, files).
 
+    keep_alive=0 instructs Ollama to evict the model from VRAM as soon as
+    the response is complete, freeing memory between requests.
+    """
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTION},
         {"role": "user",   "content": prompt_text},
@@ -102,46 +110,47 @@ def query_model(
     logger.debug(f"\n{sep}\nPROMPT\n{sep}\n{prompt_text}\n{sep}")
 
     try:
-        # Sfrutta il vincolo di formato nativo di Ollama passando lo schema JSON di Pydantic
-        response = ollama.chat(
+        raw_response = _ollama_client.chat(
             model=MODEL_NAME,
             messages=messages,
             format=ModelOutput.model_json_schema(),
+            keep_alive=0,           # Evict model from VRAM after this request
             options={
                 "num_predict": MAX_TOKENS,
-                "temperature": 0.0  # Zero per garantire la massima stabilità strutturale
-            }
+                "temperature": 0.0,
+            },
         )
-        raw_output = response.message.content
+        raw_output = raw_response.message.content
+    except ollama.ResponseError as exc:
+        logger.error(f"Ollama API error {exc.status_code}: {exc.error}")
+        raise
     except Exception as exc:
-        logger.error(f"Ollama API call failed: {exc}")
+        logger.error(f"Ollama call failed: {exc}")
         raise
 
-    logger.debug(f"\n{sep}\nRAW MODEL OUTPUT\n{sep}\n{raw_output}\n{sep}")
+    logger.debug(f"\n{sep}\nRAW OUTPUT\n{sep}\n{raw_output}\n{sep}")
 
     try:
         parsed = ModelOutput.model_validate_json(raw_output)
     except Exception as exc:
-        logger.error(f"Failed to parse structured output validation: {exc}")
+        logger.error(f"Structured output parse error: {exc}")
         return raw_output, raw_output, []
 
     if parsed.thinking:
-        logger.debug(f"\n{sep}\nTHINKING BLOCK\n{sep}\n{parsed.thinking}\n{sep}")
+        logger.debug(f"\n{sep}\nTHINKING\n{sep}\n{parsed.thinking}\n{sep}")
 
-    extracted_files: list[dict] = []
+    safe_files: list[dict] = []
     for f in parsed.files:
         safe_name = Path(f.name).name
-        if not safe_name or safe_name.startswith(".") \
-                or "/" in safe_name or "\\" in safe_name:
+        if not safe_name or safe_name.startswith(".") or "/" in safe_name or "\\" in safe_name:
             logger.warning(f"Rejected unsafe file name from model: {f.name!r}")
             continue
-        extracted_files.append({"name": safe_name, "content": f.content})
+        safe_files.append({"name": safe_name, "content": f.content})
 
-    if extracted_files:
-        names = [f["name"] for f in extracted_files]
-        logger.info(f"Model produced {len(extracted_files)} file(s): {names}")
+    if safe_files:
+        logger.info(f"Model produced {len(safe_files)} file(s): {[f['name'] for f in safe_files]}")
 
-    return raw_output, parsed.response, extracted_files
+    return raw_output, parsed.response, safe_files
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MIME helpers
@@ -164,49 +173,38 @@ _EXTRA_MIME: dict[str, str] = {
 
 def _mime_type(filename: str) -> str:
     ext = Path(filename).suffix.lower()
-    if ext in _EXTRA_MIME:
-        return _EXTRA_MIME[ext]
-    guessed, _ = mimetypes.guess_type(filename)
-    return guessed or "application/octet-stream"
+    return _EXTRA_MIME.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Markdown output
+# Output persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_markdown(prompt: str, response: str, timestamp: str, logger: logging.Logger) -> Path:
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    filename = Path(OUTPUT_FOLDER) / f"{timestamp}_response.md"
-
-    human_ts = datetime.strptime(timestamp, "%Y%m%d_%H%M%S").strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-    content = (
+    path = Path(OUTPUT_FOLDER) / f"{timestamp}_response.md"
+    human_ts = datetime.strptime(timestamp, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    path.write_text(
         f"# LLM Response\n\n"
         f"**Generated:** {human_ts}  \n"
         f"**Model:** {MODEL_NAME}\n\n"
         f"---\n\n"
-        f"## Prompt\n\n"
-        f"{prompt}\n\n"
+        f"## Prompt\n\n{prompt}\n\n"
         f"---\n\n"
-        f"## Response\n\n"
-        f"{response}\n"
+        f"## Response\n\n{response}\n",
+        encoding="utf-8",
     )
-
-    filename.write_text(content, encoding="utf-8")
-    logger.info(f"Markdown → {filename}")
-    return filename
+    logger.info(f"Markdown → {path}")
+    return path
 
 
-def save_generated_files(
-    files: list[dict], timestamp: str, logger: logging.Logger
-) -> list[dict]:
+def save_generated_files(files: list[dict], timestamp: str, logger: logging.Logger) -> list[dict]:
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     saved = []
     for file_info in files:
         stored_name = f"{timestamp}_{file_info['name']}"
         dest = Path(OUTPUT_FOLDER) / stored_name
         dest.write_text(file_info["content"], encoding="utf-8")
-        logger.info(f"File saved → {dest}")
+        logger.info(f"Saved → {dest}")
         saved.append({
             "name":         file_info["name"],
             "stored_name":  stored_name,
@@ -217,22 +215,25 @@ def save_generated_files(
         })
     return saved
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram payload builder
+# ─────────────────────────────────────────────────────────────────────────────
 
 _TG_CAPTION_LIMIT = 1024
 _TG_MESSAGE_LIMIT = 4096
 
 _MIME_EMOJI: list[tuple[str, str]] = [
-    ("text/x-python",     "🐍"),
-    ("text/javascript",   "📜"),
-    ("text/typescript",   "📜"),
-    ("text/x-shellscript","🖥️"),
-    ("text/markdown",     "📝"),
-    ("text/html",         "🌐"),
-    ("text/csv",          "📊"),
-    ("application/json",  "🗂️"),
-    ("application/xml",   "🗂️"),
-    ("text/yaml",         "🗂️"),
-    ("text/plain",        "📄"),
+    ("text/x-python",      "🐍"),
+    ("text/javascript",    "📜"),
+    ("text/typescript",    "📜"),
+    ("text/x-shellscript", "🖥️"),
+    ("text/markdown",      "📝"),
+    ("text/html",          "🌐"),
+    ("text/csv",           "📊"),
+    ("application/json",   "🗂️"),
+    ("application/xml",    "🗂️"),
+    ("text/yaml",          "🗂️"),
+    ("text/plain",         "📄"),
 ]
 
 
@@ -255,7 +256,6 @@ def _make_document_entry(
         caption += f"\n{extra_caption}"
     if len(caption) > _TG_CAPTION_LIMIT:
         caption = caption[: _TG_CAPTION_LIMIT - 1] + "…"
-
     return {
         "filename":     display_name,
         "stored_name":  stored_name,
@@ -279,6 +279,7 @@ def build_telegram_payload(
         f"📦 *{file_count} file{'s' if file_count != 1 else ''} generated*\n"
         if file_count else ""
     )
+
     caption = (
         f"✅ *Reply generated*\n"
         f"📋 *Goal:* {prompt_short}\n"
@@ -289,22 +290,20 @@ def build_telegram_payload(
         caption = caption[: _TG_CAPTION_LIMIT - 1] + "…"
 
     if len(reply) > _TG_MESSAGE_LIMIT:
-        reply = reply[:_TG_MESSAGE_LIMIT - 10] + "…"
+        reply = reply[: _TG_MESSAGE_LIMIT - 10] + "…"
 
     documents: list[dict] = []
 
-    md_stored = markdown_path.name
     md_content = markdown_path.read_text(encoding="utf-8")
     documents.append(
         _make_document_entry(
             display_name="response.md",
-            stored_name=md_stored,
+            stored_name=markdown_path.name,
             content=md_content,
             mime_type="text/markdown",
             extra_caption="Full response with prompt",
         )
     )
-
     for f in saved_files:
         documents.append(
             _make_document_entry(
@@ -317,7 +316,7 @@ def build_telegram_payload(
 
     return {
         "caption":   caption,
-        "reply":     "*Reply generated*",
+        "reply":     reply,        # actual (possibly truncated) response text
         "documents": documents,
     }
 
@@ -325,24 +324,22 @@ def build_telegram_payload(
 # Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(
-    input_data: dict, logger: logging.Logger, timestamp: str
-) -> dict:
-    prompt = input_data.get("prompt")
+def run_pipeline(input_data: dict, logger: logging.Logger, timestamp: str) -> dict:
+    prompt = input_data.get("prompt", "").strip()
     if not prompt:
         raise ValueError("Input JSON must contain a non-empty 'prompt' key.")
 
     logger.info(f"Prompt: {prompt}")
 
-    # Ollama gestisce le richieste in modo sicuro e isolato
-    raw_output, final_response, extracted_files = query_model(prompt, logger)
+    _, final_response, extracted_files = query_model(prompt, logger)
 
     markdown_path = save_markdown(prompt, final_response, timestamp, logger)
     saved_files   = save_generated_files(extracted_files, timestamp, logger)
-    telegram = build_telegram_payload(
+    telegram      = build_telegram_payload(
         prompt, timestamp, final_response, markdown_path, saved_files
     )
-    logger.info(f"=== Done at {datetime.now().strftime('%H:%M:%S')} ===")
+
+    logger.info(f"=== Done {datetime.now().strftime('%H:%M:%S')} ===")
 
     return {
         "status":        "ok",
@@ -355,52 +352,52 @@ def run_pipeline(
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP server mode
+# HTTP server
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_server_mode() -> None:
     boot_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger  = setup_logger(boot_ts, "server_boot")
-    logger.info(f"=== local_LLM [Ollama Server Mode] port {SERVER_PORT} ===")
+    logger.info(f"=== localLLM server — port {SERVER_PORT} | Ollama → {OLLAMA_HOST} ===")
 
     app = Flask(__name__)
 
     @app.route("/health", methods=["GET"])
-    def health() -> tuple:
+    def health():
+        ollama_reachable = False
+        try:
+            _ollama_client.list()
+            ollama_reachable = True
+        except Exception:
+            pass
         return jsonify({
-            "status":     "ok",
-            "model":      MODEL_NAME,
-            "max_tokens": MAX_TOKENS,
+            "status":           "ok",
+            "model":            MODEL_NAME,
+            "ollama_host":      OLLAMA_HOST,
+            "ollama_reachable": ollama_reachable,
+            "max_tokens":       MAX_TOKENS,
         }), 200
 
     @app.route("/files/<path:filename>", methods=["GET"])
-    def download_file(filename: str) -> tuple:
+    def download_file(filename: str):
         safe_name  = Path(filename).name
         output_dir = Path(OUTPUT_FOLDER).resolve()
-        target     = output_dir / safe_name
-
-        if not target.exists():
+        if not (output_dir / safe_name).exists():
             return jsonify({"status": "error", "message": "File not found"}), 404
-
         return send_from_directory(
-            str(output_dir),
-            safe_name,
-            as_attachment=True,
-            mimetype=_mime_type(safe_name),
+            str(output_dir), safe_name,
+            as_attachment=True, mimetype=_mime_type(safe_name),
         )
 
     @app.route("/prompt", methods=["POST"])
-    def prompt() -> tuple:
+    def handle_prompt():
         body = flask_request.get_json(force=True, silent=True)
         if not body:
-            return jsonify({
-                "status":  "error",
-                "message": "Invalid or missing JSON body",
-            }), 400
+            return jsonify({"status": "error", "message": "Invalid or missing JSON body"}), 400
 
         timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
         req_logger = setup_logger(timestamp, "api_prompt")
-        req_logger.info(f"POST /prompt — client {flask_request.remote_addr}")
+        req_logger.info(f"POST /prompt — {flask_request.remote_addr}")
 
         try:
             result = run_pipeline(body, req_logger, timestamp)
@@ -409,14 +406,14 @@ def run_server_mode() -> None:
             req_logger.warning(f"Bad request: {exc}")
             return jsonify({"status": "error", "message": str(exc)}), 400
         except Exception as exc:
-            req_logger.error(f"Pipeline failed: {exc}", exc_info=True)
+            req_logger.error(f"Pipeline error: {exc}", exc_info=True)
             return jsonify({"status": "error", "message": str(exc)}), 500
 
-    # Ora threaded può essere True senza rischi: Ollama gestisce la coda delle richieste out-of-process
+    # Ollama handles its own request queue out-of-process, so threaded=True is safe
     app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, threaded=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI file mode
+# CLI file mode (local testing — reads first JSON in input/)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_file_mode() -> None:
@@ -433,8 +430,8 @@ def run_file_mode() -> None:
     input_path = json_files[0]
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger     = setup_logger(timestamp, input_path.stem)
-    logger.info(f"=== local_LLM [Ollama File Mode] {timestamp} ===")
-    logger.info(f"Reading {input_path}")
+    logger.info(f"=== localLLM file mode — {timestamp} ===")
+    logger.info(f"Input: {input_path}")
 
     try:
         input_data = json.loads(input_path.read_text(encoding="utf-8"))
@@ -454,15 +451,14 @@ def run_file_mode() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Local LLM via Ollama Engine — CLI file mode or HTTP service (--serve)"
+        description="localLLM — Ollama-powered LLM server with Telegram integration"
     )
     parser.add_argument(
         "--serve",
         action="store_true",
-        help=f"Start HTTP service on port {SERVER_PORT} instead of processing input/",
+        help=f"Start HTTP server on port {SERVER_PORT} (default: process input/ folder)",
     )
     args = parser.parse_args()
-
     if args.serve:
         run_server_mode()
     else:
