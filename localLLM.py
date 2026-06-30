@@ -18,13 +18,14 @@ from pydantic import BaseModel, Field
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL_NAME    = "qwen3-5-9b-local"        # Name assigned via 'ollama create'
+#MODEL_NAME    = "qwen3-5-9b-local"        # Name assigned via 'ollama create'
+MODEL_NAME    = "gemma4-e4b-8b-loc"        # Name assigned via 'ollama create'
 OLLAMA_HOST   = "http://localhost:48085"  # Ollama daemon — managed by ollama_manager.sh
 SERVER_PORT   = 48084                     # This Flask web server
 INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
-MAX_TOKENS    = 12000
+MAX_TOKENS    = 30000
 
 # Single Ollama client instance, reused across all requests
 _ollama_client = ollama.Client(host=OLLAMA_HOST)
