@@ -14,18 +14,24 @@ import ollama
 from flask import Flask, jsonify, send_from_directory, request as flask_request
 from pydantic import BaseModel, Field
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-#MODEL_NAME    = "qwen3-5-9b-local"        # Name assigned via 'ollama create'
-MODEL_NAME    = "gemma4-e4b-8b-loc"        # Name assigned via 'ollama create'
+#MODEL_NAME    = "qwen3-5-9b-local"        # Downloaded lm and created via 'ollama create'
+#MODEL_NAME    = "gemma4-e4b-8b-loc"        # Downloaded lm and created 'ollama create'
+MODEL_NAME    = "gemma4:e4b-mlx"        # Downloaded from ollama
+
 OLLAMA_HOST   = "http://localhost:48085"  # Ollama daemon — managed by ollama_manager.sh
 SERVER_PORT   = 48084                     # This Flask web server
 INPUT_FOLDER  = "input"
 OUTPUT_FOLDER = "output"
 LOG_FOLDER    = "logs"
-MAX_TOKENS    = 30000
+MAX_TOKENS    = 50000
+CONTEXT_LIMIT = 50000   # max chars of code/content passed in a single prompt
+TEMPERATURE = 0.4
 
 # Single Ollama client instance, reused across all requests
 _ollama_client = ollama.Client(host=OLLAMA_HOST)
@@ -118,7 +124,8 @@ def query_model(
             keep_alive=0,           # Evict model from VRAM after this request
             options={
                 "num_predict": MAX_TOKENS,
-                "temperature": 0.0,
+                "temperature": TEMPERATURE,
+                "num_ctx": CONTEXT_LIMIT,
             },
         )
         raw_output = raw_response.message.content
